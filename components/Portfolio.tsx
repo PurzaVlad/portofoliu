@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { site, type Project } from '@/content/projects';
 import Clock from './Clock';
 
@@ -10,7 +10,21 @@ const CURVE = 140;
 const MOBILE_QUERY = '(max-width: 820px)';
 const REDUCED_QUERY = '(prefers-reduced-motion: reduce)';
 
+// How quickly the drawn position catches up with the real scroll position (ms).
+// A little easing turns mouse-wheel jumps into glides; touch stays close to the finger.
+const TAU_DESKTOP = 70;
+const TAU_MOBILE = 40;
+
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
+
+type RGB = [number, number, number];
+const hexToRgb = (hex: string): RGB => {
+  const v = parseInt(hex.slice(1), 16);
+  return [(v >> 16) & 255, (v >> 8) & 255, v & 255];
+};
+// Blend two colors at t ∈ [0, 1].
+const mix = (a: RGB, b: RGB, t: number) =>
+  `rgb(${Math.round(a[0] + (b[0] - a[0]) * t)},${Math.round(a[1] + (b[1] - a[1]) * t)},${Math.round(a[2] + (b[2] - a[2]) * t)})`;
 
 // useLayoutEffect warns on the server; this runs it only in the browser.
 const useIsoLayoutEffect = typeof window === 'undefined' ? useEffect : useLayoutEffect;
@@ -18,8 +32,11 @@ const useIsoLayoutEffect = typeof window === 'undefined' ? useEffect : useLayout
 export default function Portfolio({ projects }: { projects: ResolvedProject[] }) {
   const n = projects.length;
   const [active, setActive] = useState(0);
-  const current = projects[active];
+  const first = projects[0];
 
+  const rootRef = useRef<HTMLDivElement>(null);
+  const accentRef = useRef<HTMLElement>(null);
+  const captionRefs = useRef<(HTMLParagraphElement | null)[]>([]);
   const scrollerRef = useRef<HTMLDivElement>(null);
   const stripRef = useRef<HTMLDivElement>(null);
   const rowRefs = useRef<(HTMLButtonElement | null)[]>([]);
@@ -29,18 +46,18 @@ export default function Portfolio({ projects }: { projects: ResolvedProject[] })
   const mobileRef = useRef(false);
   const reducedRef = useRef(false);
   const rafRef = useRef(0);
+  const posRef = useRef(0);
+  const lastTimeRef = useRef(0);
+  const jumpRef = useRef(true);
 
-  // All per-frame work happens here: plain math, then style writes. No React state
-  // changes except when the active row flips.
-  const update = useCallback(() => {
-    rafRef.current = 0;
-    const el = scrollerRef.current;
-    if (!el) return;
+  const tints = useMemo(() => projects.map((p) => hexToRgb(p.tint)), [projects]);
+  const accents = useMemo(() => projects.map((p) => hexToRgb(p.color)), [projects]);
 
+  // Draws everything for a (continuous) position. Plain math, then style writes.
+  // No React state changes except when the active row flips.
+  const render = useCallback((pos: number) => {
     const mobile = mobileRef.current;
     const reduced = reducedRef.current;
-    const ROW = mobile ? 56 : 64;
-    const pos = clamp(el.scrollTop / ROW, 0, n - 1);
     const A = CURVE * (mobile ? 0.42 : 1);
     const step = mobile ? 0.42 : 0.36;
     const tiltK = mobile ? 52 : 38;
@@ -62,6 +79,12 @@ export default function Portfolio({ projects }: { projects: ResolvedProject[] })
 
       const dot = dotRefs.current[i];
       if (dot) dot.style.transform = `scale(${Math.max(0, 1 - ad * 1.5).toFixed(3)})`;
+
+      const caption = captionRefs.current[i];
+      if (caption) {
+        caption.style.opacity = clamp(1 - Math.abs(d) * 1.8, 0, 1).toFixed(3);
+        caption.style.transform = reduced ? 'none' : `translate3d(0,${(d * 14).toFixed(2)}px,0)`;
+      }
 
       const video = videoRefs.current[i];
       if (video) {
@@ -85,6 +108,13 @@ export default function Portfolio({ projects }: { projects: ResolvedProject[] })
       stripRef.current.style.transform = `translate3d(0,${(-(pos / n) * 100).toFixed(4)}%,0)`;
     }
 
+    // Colors blend between neighbouring projects instead of switching.
+    const lo = Math.floor(pos);
+    const hi = Math.min(lo + 1, n - 1);
+    const f = pos - lo;
+    if (rootRef.current) rootRef.current.style.backgroundColor = mix(tints[lo], tints[hi], f);
+    if (accentRef.current) accentRef.current.style.color = mix(accents[lo], accents[hi], f);
+
     const a = Math.round(pos);
     if (a !== activeRef.current) {
       activeRef.current = a;
@@ -95,11 +125,49 @@ export default function Portfolio({ projects }: { projects: ResolvedProject[] })
         /* unsupported or blocked */
       }
     }
-  }, [n, projects]);
+  }, [n, projects, tints, accents]);
+
+  // Eases the drawn position toward the scroll position, frame-rate independent.
+  // The loop only runs while the two differ, so an idle page does no work.
+  const frame = useCallback(
+    (now: number) => {
+      rafRef.current = 0;
+      const el = scrollerRef.current;
+      if (!el) return;
+      const ROW = mobileRef.current ? 56 : 64;
+      const target = clamp(el.scrollTop / ROW, 0, n - 1);
+
+      let pos = posRef.current;
+      if (jumpRef.current || reducedRef.current) {
+        pos = target;
+        jumpRef.current = false;
+      } else {
+        const dt = Math.min(64, Math.max(0, now - lastTimeRef.current));
+        const tau = mobileRef.current ? TAU_MOBILE : TAU_DESKTOP;
+        pos += (target - pos) * (1 - Math.exp(-dt / tau));
+        if (Math.abs(target - pos) < 0.0005) pos = target;
+      }
+      lastTimeRef.current = now;
+      posRef.current = pos;
+      render(pos);
+
+      if (pos !== target) rafRef.current = requestAnimationFrame(frame);
+    },
+    [n, render],
+  );
 
   const schedule = useCallback(() => {
-    if (!rafRef.current) rafRef.current = requestAnimationFrame(update);
-  }, [update]);
+    if (!rafRef.current) {
+      lastTimeRef.current = performance.now();
+      rafRef.current = requestAnimationFrame(frame);
+    }
+  }, [frame]);
+
+  // Resizes and media-query flips change ROW, so skip easing for that frame.
+  const jump = useCallback(() => {
+    jumpRef.current = true;
+    schedule();
+  }, [schedule]);
 
   useIsoLayoutEffect(() => {
     const mq = window.matchMedia(MOBILE_QUERY);
@@ -107,26 +175,51 @@ export default function Portfolio({ projects }: { projects: ResolvedProject[] })
     const sync = () => {
       mobileRef.current = mq.matches;
       reducedRef.current = rq.matches;
-      schedule();
+      jump();
     };
     mobileRef.current = mq.matches;
     reducedRef.current = rq.matches;
-    update();
+    jumpRef.current = true;
+    frame(performance.now());
 
     const el = scrollerRef.current!;
+
+    // A notched mouse wheel scrolls ~100px per click, which would skip a row past
+    // the snap point. Turn each notch into exactly one row; the easing above makes
+    // the jump glide. Trackpads (small, fractional deltas) keep native scrolling.
+    let wheelIndex = -1;
+    let wheelTimer = 0;
+    const onWheel = (e: WheelEvent) => {
+      if (e.ctrlKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;
+      const legacy = (e as WheelEvent & { wheelDeltaY?: number }).wheelDeltaY;
+      const notched =
+        e.deltaMode === 1 || (!!legacy && legacy % 120 === 0 && Math.abs(e.deltaY) >= 40);
+      if (!notched) return;
+      e.preventDefault();
+      const ROW = mobileRef.current ? 56 : 64;
+      if (wheelIndex < 0) wheelIndex = Math.round(el.scrollTop / ROW);
+      wheelIndex = clamp(wheelIndex + Math.sign(e.deltaY), 0, n - 1);
+      el.scrollTo({ top: wheelIndex * ROW, behavior: 'instant' });
+      clearTimeout(wheelTimer);
+      wheelTimer = window.setTimeout(() => (wheelIndex = -1), 250);
+    };
+
+    el.addEventListener('wheel', onWheel, { passive: false });
     el.addEventListener('scroll', schedule, { passive: true });
-    window.addEventListener('resize', schedule);
+    window.addEventListener('resize', jump);
     mq.addEventListener('change', sync);
     rq.addEventListener('change', sync);
     return () => {
+      el.removeEventListener('wheel', onWheel);
+      clearTimeout(wheelTimer);
       el.removeEventListener('scroll', schedule);
-      window.removeEventListener('resize', schedule);
+      window.removeEventListener('resize', jump);
       mq.removeEventListener('change', sync);
       rq.removeEventListener('change', sync);
       cancelAnimationFrame(rafRef.current);
       rafRef.current = 0;
     };
-  }, [update, schedule]);
+  }, [frame, schedule, jump, n]);
 
   const goTo = (i: number) => {
     const ROW = mobileRef.current ? 56 : 64;
@@ -134,17 +227,14 @@ export default function Portfolio({ projects }: { projects: ResolvedProject[] })
   };
 
   return (
-    <div
-      className="relative h-dvh overflow-hidden transition-[background-color] duration-500 ease-[ease]"
-      style={{ backgroundColor: current.tint }}
-    >
+    <div ref={rootRef} className="relative h-dvh overflow-hidden" style={{ backgroundColor: first.tint }}>
       <header className="pointer-events-none absolute left-0 top-0 z-20 px-24 pt-11 max-[820px]:px-4 max-[820px]:pt-5">
         <h1 className="text-[17px] font-semibold leading-snug tracking-[-0.01em] text-ink max-[820px]:text-[15px]">
           {site.name}
         </h1>
         <p className="mt-0.5 text-[17px] leading-snug tracking-[-0.01em] text-body max-[820px]:text-[15px]">
           I build apps that{' '}
-          <strong className="font-semibold transition-colors duration-[400ms]" style={{ color: current.color }}>
+          <strong ref={accentRef} className="font-semibold" style={{ color: first.color }}>
             open doors.
           </strong>
         </p>
@@ -221,7 +311,7 @@ export default function Portfolio({ projects }: { projects: ResolvedProject[] })
               <div
                 className="relative aspect-[9/19.5] w-[min(290px,calc((100dvh-220px)*0.4615))] overflow-hidden rounded-[40px] max-[820px]:w-[min(100%,180px,calc((100dvh-200px)*0.4615))] max-[820px]:rounded-[24px]"
                 style={{
-                  backgroundColor: current.screen,
+                  backgroundColor: first.screen,
                   boxShadow: '0 0 0 1px rgba(20,20,19,.06), 0 40px 80px -34px rgba(20,20,19,.4)',
                   transform: 'translateZ(0)',
                 }}
@@ -269,11 +359,25 @@ export default function Portfolio({ projects }: { projects: ResolvedProject[] })
                 </div>
               </div>
 
-              <p
-                aria-live="polite"
-                className="mt-6 min-h-[4.35em] max-w-[360px] px-6 text-center text-[15px] leading-[1.45] text-body max-[820px]:mt-4 max-[820px]:min-h-[5.8em] max-[820px]:px-0 max-[820px]:text-[12px]"
-              >
-                {current.blurb}
+              {/* All blurbs share one grid cell: the tallest reserves the height and they
+                  cross-fade as you scroll. Screen readers only get the active one. */}
+              <div className="mt-6 grid max-w-[360px] px-6 text-center text-[15px] leading-[1.45] text-body max-[820px]:mt-4 max-[820px]:px-0 max-[820px]:text-[12px]">
+                {projects.map((p, i) => (
+                  <p
+                    key={p.name}
+                    ref={(el) => {
+                      captionRefs.current[i] = el;
+                    }}
+                    aria-hidden={i !== active}
+                    className="col-start-1 row-start-1 will-change-[opacity,transform]"
+                    style={{ opacity: i === 0 ? 1 : 0 }}
+                  >
+                    {p.blurb}
+                  </p>
+                ))}
+              </div>
+              <p aria-live="polite" className="sr-only">
+                {projects[active].blurb}
               </p>
             </div>
           </div>
