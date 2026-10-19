@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, type CSSProperties } from 'react';
 import { site, type Project } from '@/content/projects';
 import Clock from './Clock';
 
@@ -10,224 +10,339 @@ const CURVE = 140;
 const MOBILE_QUERY = '(max-width: 820px)';
 const REDUCED_QUERY = '(prefers-reduced-motion: reduce)';
 
-// How quickly the drawn position catches up with the real scroll position (ms).
-// A little easing turns mouse-wheel jumps into glides; touch stays close to the finger.
-const TAU_DESKTOP = 70;
-const TAU_MOBILE = 40;
+// Time constant of the eased scroll used for wheel, keyboard and clicks (ms).
+// Each frame closes 1 - e^(-dt/TAU) of the remaining distance, so it feels the
+// same at 60, 120 or 144 Hz.
+const TAU = 120;
+// After the last trackpad event, wait this long before gliding to the nearest row.
+const SETTLE_MS = 140;
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
-type RGB = [number, number, number];
-const hexToRgb = (hex: string): RGB => {
-  const v = parseInt(hex.slice(1), 16);
-  return [(v >> 16) & 255, (v >> 8) & 255, v & 255];
-};
-// Blend two colors at t ∈ [0, 1].
-const mix = (a: RGB, b: RGB, t: number) =>
-  `rgb(${Math.round(a[0] + (b[0] - a[0]) * t)},${Math.round(a[1] + (b[1] - a[1]) * t)},${Math.round(a[2] + (b[2] - a[2]) * t)})`;
-
-// useLayoutEffect warns on the server; this runs it only in the browser.
 const useIsoLayoutEffect = typeof window === 'undefined' ? useEffect : useLayoutEffect;
 
 export default function Portfolio({ projects }: { projects: ResolvedProject[] }) {
   const n = projects.length;
-  const [active, setActive] = useState(0);
   const first = projects[0];
 
   const rootRef = useRef<HTMLDivElement>(null);
+  const bgLoRef = useRef<HTMLDivElement>(null);
+  const bgHiRef = useRef<HTMLDivElement>(null);
   const accentRef = useRef<HTMLElement>(null);
-  const captionRefs = useRef<(HTMLParagraphElement | null)[]>([]);
   const scrollerRef = useRef<HTMLDivElement>(null);
   const stripRef = useRef<HTMLDivElement>(null);
+  const liveRef = useRef<HTMLParagraphElement>(null);
   const rowRefs = useRef<(HTMLButtonElement | null)[]>([]);
   const dotRefs = useRef<(HTMLSpanElement | null)[]>([]);
+  const screenRefs = useRef<(HTMLDivElement | null)[]>([]);
+  const captionRefs = useRef<(HTMLParagraphElement | null)[]>([]);
   const videoRefs = useRef<(HTMLVideoElement | null)[]>([]);
-  const activeRef = useRef(0);
+
   const mobileRef = useRef(false);
   const reducedRef = useRef(false);
-  const rafRef = useRef(0);
-  const posRef = useRef(0);
-  const lastTimeRef = useRef(0);
-  const jumpRef = useRef(true);
+  const lastPosRef = useRef(Number.NaN);
+  const lastLoRef = useRef(-1);
+  const activeRef = useRef(0);
 
-  const tints = useMemo(() => projects.map((p) => hexToRgb(p.tint)), [projects]);
-  const accents = useMemo(() => projects.map((p) => hexToRgb(p.color)), [projects]);
+  // Eased scroll state. While `owned`, this loop writes scrollTop itself and
+  // native snapping is switched off so the browser doesn't fight it.
+  const animRef = useRef({ owned: false, running: false, gesture: false, cur: 0, target: 0, last: 0, raf: 0 });
+  const nativeRafRef = useRef(0);
 
-  // Draws everything for a (continuous) position. Plain math, then style writes.
-  // No React state changes except when the active row flips.
-  const render = useCallback((pos: number) => {
-    const mobile = mobileRef.current;
-    const reduced = reducedRef.current;
-    const A = CURVE * (mobile ? 0.42 : 1);
-    const step = mobile ? 0.42 : 0.36;
-    const tiltK = mobile ? 52 : 38;
+  const rowPx = () => (mobileRef.current ? 56 : 64);
 
-    for (let i = 0; i < n; i++) {
-      const row = rowRefs.current[i];
-      if (!row) continue;
-      const d = i - pos;
-      const th = clamp(d * step, -1.45, 1.45);
-      const c = Math.cos(th);
-      const ad = Math.min(Math.abs(d), 4);
-      const k = Math.max(0, 1 - Math.abs(d));
-      const sc = (0.72 + 0.28 * c) * (mobile ? 0.9 + 0.22 * k : 1);
+  const accents = useMemo(() => {
+    const rgb = projects.map((p) => {
+      const v = parseInt(p.color.slice(1), 16);
+      return [(v >> 16) & 255, (v >> 8) & 255, v & 255];
+    });
+    return (lo: number, hi: number, t: number) =>
+      `rgb(${rgb[lo].map((c, j) => Math.round(c + (rgb[hi][j] - c) * t)).join(',')})`;
+  }, [projects]);
 
-      row.style.transform = reduced
-        ? 'none'
-        : `translate3d(${(A * c).toFixed(2)}px,0,0) rotateX(${(-th * tiltK).toFixed(2)}deg) scale(${sc.toFixed(4)})`;
-      row.style.opacity = Math.max(0.1, c * (1 - ad * 0.12)).toFixed(3);
+  // Draws everything for a continuous position (0 … n-1). Only transforms and
+  // opacity change per frame, so it all stays on the compositor. React never
+  // re-renders while scrolling.
+  const render = useCallback(
+    (pos: number) => {
+      if (pos === lastPosRef.current) return;
+      lastPosRef.current = pos;
 
-      const dot = dotRefs.current[i];
-      if (dot) dot.style.transform = `scale(${Math.max(0, 1 - ad * 1.5).toFixed(3)})`;
+      const mobile = mobileRef.current;
+      const reduced = reducedRef.current;
+      const A = CURVE * (mobile ? 0.42 : 1);
+      const step = mobile ? 0.42 : 0.36;
+      const tiltK = mobile ? 52 : 38;
 
-      const caption = captionRefs.current[i];
-      if (caption) {
-        caption.style.opacity = clamp(1 - Math.abs(d) * 1.8, 0, 1).toFixed(3);
-        caption.style.transform = reduced ? 'none' : `translate3d(0,${(d * 14).toFixed(2)}px,0)`;
-      }
+      for (let i = 0; i < n; i++) {
+        const d = i - pos;
+        const absD = Math.abs(d);
+        const th = clamp(d * step, -1.45, 1.45);
+        const c = Math.cos(th);
+        const ad = Math.min(absD, 4);
+        const k = Math.max(0, 1 - absD);
+        const sc = (0.72 + 0.28 * c) * (mobile ? 0.9 + 0.22 * k : 1);
 
-      const video = videoRefs.current[i];
-      if (video) {
-        if (Math.abs(d) < 1.2) {
-          // Poster and source are attached lazily so they never compete with first paint.
-          if (!video.getAttribute('src')) {
-            if (projects[i].poster) video.poster = projects[i].poster;
-            video.src = projects[i].video;
+        const row = rowRefs.current[i];
+        if (row) {
+          row.style.transform = reduced
+            ? 'none'
+            : `translate3d(${(A * c).toFixed(2)}px,0,0) rotateX(${(-th * tiltK).toFixed(2)}deg) scale(${sc.toFixed(4)})`;
+          row.style.opacity = Math.max(0.1, c * (1 - ad * 0.12)).toFixed(3);
+        }
+
+        const dot = dotRefs.current[i];
+        if (dot) dot.style.transform = `scale(${Math.max(0, 1 - ad * 1.5).toFixed(3)})`;
+
+        const caption = captionRefs.current[i];
+        if (caption) {
+          caption.style.opacity = clamp(1 - absD * 1.8, 0, 1).toFixed(3);
+          caption.style.transform = reduced ? 'none' : `translate3d(0,${(d * 14).toFixed(2)}px,0)`;
+        }
+
+        const video = videoRefs.current[i];
+        if (video) {
+          if (absD < 1.2) {
+            // Poster and source attach lazily so they never compete with first paint.
+            if (!video.getAttribute('src')) {
+              if (projects[i].poster) video.poster = projects[i].poster;
+              video.src = projects[i].video;
+            }
+            if (video.paused) {
+              video.muted = true;
+              video.play().catch(() => {});
+            }
+          } else if (!video.paused) {
+            video.pause();
           }
-          if (video.paused) {
-            video.muted = true;
-            video.play().catch(() => {});
-          }
-        } else if (!video.paused) {
-          video.pause();
         }
       }
-    }
 
-    if (stripRef.current) {
-      stripRef.current.style.transform = `translate3d(0,${(-(pos / n) * 100).toFixed(4)}%,0)`;
-    }
-
-    // Colors blend between neighbouring projects instead of switching.
-    const lo = Math.floor(pos);
-    const hi = Math.min(lo + 1, n - 1);
-    const f = pos - lo;
-    if (rootRef.current) rootRef.current.style.backgroundColor = mix(tints[lo], tints[hi], f);
-    if (accentRef.current) accentRef.current.style.color = mix(accents[lo], accents[hi], f);
-
-    const a = Math.round(pos);
-    if (a !== activeRef.current) {
-      activeRef.current = a;
-      setActive(a);
-      try {
-        navigator.vibrate?.(6);
-      } catch {
-        /* unsupported or blocked */
+      if (stripRef.current) {
+        stripRef.current.style.transform = `translate3d(0,${(-(pos / n) * 100).toFixed(4)}%,0)`;
       }
-    }
-  }, [n, projects, tints, accents]);
 
-  // Eases the drawn position toward the scroll position, frame-rate independent.
-  // The loop only runs while the two differ, so an idle page does no work.
-  const frame = useCallback(
-    (now: number) => {
-      rafRef.current = 0;
-      const el = scrollerRef.current;
-      if (!el) return;
-      const ROW = mobileRef.current ? 56 : 64;
-      const target = clamp(el.scrollTop / ROW, 0, n - 1);
-
-      let pos = posRef.current;
-      if (jumpRef.current || reducedRef.current) {
-        pos = target;
-        jumpRef.current = false;
-      } else {
-        const dt = Math.min(64, Math.max(0, now - lastTimeRef.current));
-        const tau = mobileRef.current ? TAU_MOBILE : TAU_DESKTOP;
-        pos += (target - pos) * (1 - Math.exp(-dt / tau));
-        if (Math.abs(target - pos) < 0.0005) pos = target;
+      // Background: two full-screen color layers, the upper one fading in. Only
+      // opacity changes per frame (repainting a full-screen color would not be free).
+      const lo = Math.floor(pos);
+      const hi = Math.min(lo + 1, n - 1);
+      const f = pos - lo;
+      if (lo !== lastLoRef.current) {
+        lastLoRef.current = lo;
+        if (bgLoRef.current) bgLoRef.current.style.backgroundColor = projects[lo].tint;
+        if (bgHiRef.current) bgHiRef.current.style.backgroundColor = projects[hi].tint;
       }
-      lastTimeRef.current = now;
-      posRef.current = pos;
-      render(pos);
+      if (bgHiRef.current) bgHiRef.current.style.opacity = f.toFixed(4);
+      if (accentRef.current) accentRef.current.style.color = accents(lo, hi, f);
 
-      if (pos !== target) rafRef.current = requestAnimationFrame(frame);
+      const a = Math.round(pos);
+      if (a !== activeRef.current) {
+        const prev = activeRef.current;
+        activeRef.current = a;
+        rowRefs.current[prev]?.removeAttribute('aria-current');
+        rowRefs.current[a]?.setAttribute('aria-current', 'true');
+        captionRefs.current[prev]?.setAttribute('aria-hidden', 'true');
+        captionRefs.current[a]?.removeAttribute('aria-hidden');
+        screenRefs.current[prev]?.setAttribute('aria-hidden', 'true');
+        screenRefs.current[a]?.removeAttribute('aria-hidden');
+        if (liveRef.current) liveRef.current.textContent = projects[a].blurb;
+        try {
+          navigator.vibrate?.(6);
+        } catch {
+          /* unsupported or blocked */
+        }
+      }
     },
-    [n, render],
+    [n, projects, accents],
   );
 
-  const schedule = useCallback(() => {
-    if (!rafRef.current) {
-      lastTimeRef.current = performance.now();
-      rafRef.current = requestAnimationFrame(frame);
-    }
-  }, [frame]);
+  const renderFromScroll = useCallback(() => {
+    const el = scrollerRef.current;
+    if (el) render(clamp(el.scrollTop / rowPx(), 0, n - 1));
+  }, [n, render]);
 
-  // Resizes and media-query flips change ROW, so skip easing for that frame.
-  const jump = useCallback(() => {
-    jumpRef.current = true;
-    schedule();
-  }, [schedule]);
+  // ---- Eased scrolling (wheel, keyboard, clicks) -------------------------------
+
+  const release = useCallback(() => {
+    const s = animRef.current;
+    cancelAnimationFrame(s.raf);
+    s.running = false;
+    s.owned = false;
+    s.gesture = false;
+    if (scrollerRef.current) scrollerRef.current.style.scrollSnapType = '';
+  }, []);
+
+  const tick = useCallback(
+    (now: number) => {
+      const s = animRef.current;
+      const el = scrollerRef.current;
+      if (!el || !s.owned) return;
+      const dt = Math.min(50, Math.max(0, now - s.last));
+      s.last = now;
+      const tau = reducedRef.current ? 0 : TAU;
+      s.cur = tau ? s.cur + (s.target - s.cur) * (1 - Math.exp(-dt / tau)) : s.target;
+      const done = Math.abs(s.target - s.cur) < 0.25;
+      if (done) s.cur = s.target;
+
+      // Scroll position and every scroll-linked transform change in the same frame.
+      el.scrollTop = s.cur;
+      render(clamp(s.cur / rowPx(), 0, n - 1));
+
+      if (!done) {
+        s.raf = requestAnimationFrame(tick);
+      } else {
+        s.running = false;
+        // Hand back to native scrolling once resting on a row.
+        if (!s.gesture) release();
+      }
+    },
+    [n, render, release],
+  );
+
+  const glideTo = useCallback(
+    (px: number) => {
+      const el = scrollerRef.current;
+      if (!el) return;
+      const s = animRef.current;
+      if (!s.owned) {
+        s.owned = true;
+        s.cur = el.scrollTop;
+        el.style.scrollSnapType = 'none';
+      }
+      s.target = clamp(px, 0, (n - 1) * rowPx());
+      if (!s.running) {
+        s.running = true;
+        s.last = performance.now();
+        s.raf = requestAnimationFrame(tick);
+      }
+    },
+    [n, tick],
+  );
+
+  const goTo = useCallback(
+    (i: number) => {
+      animRef.current.gesture = false;
+      glideTo(clamp(i, 0, n - 1) * rowPx());
+    },
+    [n, glideTo],
+  );
 
   useIsoLayoutEffect(() => {
     const mq = window.matchMedia(MOBILE_QUERY);
     const rq = window.matchMedia(REDUCED_QUERY);
-    const sync = () => {
+    const root = rootRef.current!;
+    const el = scrollerRef.current!;
+    const s = animRef.current;
+
+    const readMedia = () => {
       mobileRef.current = mq.matches;
       reducedRef.current = rq.matches;
-      jump();
+      lastPosRef.current = Number.NaN;
     };
-    mobileRef.current = mq.matches;
-    reducedRef.current = rq.matches;
-    jumpRef.current = true;
-    frame(performance.now());
+    readMedia();
+    renderFromScroll();
 
-    const el = scrollerRef.current!;
+    // Native scrolling (touch, scrollbar): draw on the next frame.
+    const onScroll = () => {
+      if (s.owned || nativeRafRef.current) return;
+      nativeRafRef.current = requestAnimationFrame(() => {
+        nativeRafRef.current = 0;
+        renderFromScroll();
+      });
+    };
 
-    // A notched mouse wheel scrolls ~100px per click, which would skip a row past
-    // the snap point. Turn each notch into exactly one row; the easing above makes
-    // the jump glide. Trackpads (small, fractional deltas) keep native scrolling.
-    let wheelIndex = -1;
-    let wheelTimer = 0;
+    // Wheel and trackpad: feed the eased loop instead of jumping natively.
+    let settleTimer = 0;
     const onWheel = (e: WheelEvent) => {
       if (e.ctrlKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;
-      const legacy = (e as WheelEvent & { wheelDeltaY?: number }).wheelDeltaY;
-      const notched =
-        e.deltaMode === 1 || (!!legacy && legacy % 120 === 0 && Math.abs(e.deltaY) >= 40);
-      if (!notched) return;
       e.preventDefault();
-      const ROW = mobileRef.current ? 56 : 64;
-      if (wheelIndex < 0) wheelIndex = Math.round(el.scrollTop / ROW);
-      wheelIndex = clamp(wheelIndex + Math.sign(e.deltaY), 0, n - 1);
-      el.scrollTo({ top: wheelIndex * ROW, behavior: 'instant' });
-      clearTimeout(wheelTimer);
-      wheelTimer = window.setTimeout(() => (wheelIndex = -1), 250);
+      const ROW = rowPx();
+      const legacy = (e as WheelEvent & { wheelDeltaY?: number }).wheelDeltaY;
+      const notched = e.deltaMode === 1 || (!!legacy && legacy % 120 === 0 && Math.abs(e.deltaY) >= 40);
+      const base = s.owned ? s.target : el.scrollTop;
+
+      if (notched) {
+        // Mouse wheel: one notch = one project.
+        s.gesture = false;
+        glideTo((Math.round(base / ROW) + Math.sign(e.deltaY)) * ROW);
+        return;
+      }
+      // Trackpad: follow the fingers 1:1 (eased), then settle on the nearest row.
+      const scale = e.deltaMode === 2 ? el.clientHeight : 1;
+      s.gesture = true;
+      glideTo(base + e.deltaY * scale);
+      clearTimeout(settleTimer);
+      settleTimer = window.setTimeout(() => {
+        s.gesture = false;
+        glideTo(Math.round(s.target / ROW) * ROW);
+      }, SETTLE_MS);
     };
 
-    el.addEventListener('wheel', onWheel, { passive: false });
-    el.addEventListener('scroll', schedule, { passive: true });
-    window.addEventListener('resize', jump);
-    mq.addEventListener('change', sync);
-    rq.addEventListener('change', sync);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey) return;
+      const t = e.target as HTMLElement;
+      if (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) return;
+      const cur = s.owned ? Math.round(s.target / rowPx()) : activeRef.current;
+      const keys: Record<string, number> = {
+        ArrowDown: cur + 1,
+        ArrowUp: cur - 1,
+        PageDown: cur + 1,
+        PageUp: cur - 1,
+        Home: 0,
+        End: n - 1,
+        ' ': e.shiftKey ? cur - 1 : cur + 1,
+      };
+      if (!(e.key in keys) || (e.key === ' ' && t.tagName === 'BUTTON')) return;
+      e.preventDefault();
+      goTo(keys[e.key]);
+    };
+
+    // A finger on the screen always wins over an in-flight glide.
+    const onTouch = () => {
+      if (s.owned) release();
+    };
+    const onResize = () => {
+      if (s.owned) release();
+      lastPosRef.current = Number.NaN;
+      renderFromScroll();
+    };
+    const onMedia = () => {
+      readMedia();
+      onResize();
+    };
+
+    root.addEventListener('wheel', onWheel, { passive: false });
+    el.addEventListener('scroll', onScroll, { passive: true });
+    el.addEventListener('touchstart', onTouch, { passive: true });
+    window.addEventListener('keydown', onKey);
+    window.addEventListener('resize', onResize);
+    mq.addEventListener('change', onMedia);
+    rq.addEventListener('change', onMedia);
     return () => {
-      el.removeEventListener('wheel', onWheel);
-      clearTimeout(wheelTimer);
-      el.removeEventListener('scroll', schedule);
-      window.removeEventListener('resize', jump);
-      mq.removeEventListener('change', sync);
-      rq.removeEventListener('change', sync);
-      cancelAnimationFrame(rafRef.current);
-      rafRef.current = 0;
+      root.removeEventListener('wheel', onWheel);
+      el.removeEventListener('scroll', onScroll);
+      el.removeEventListener('touchstart', onTouch);
+      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('resize', onResize);
+      mq.removeEventListener('change', onMedia);
+      rq.removeEventListener('change', onMedia);
+      clearTimeout(settleTimer);
+      cancelAnimationFrame(nativeRafRef.current);
+      nativeRafRef.current = 0;
+      release();
     };
-  }, [frame, schedule, jump, n]);
-
-  const goTo = (i: number) => {
-    const ROW = mobileRef.current ? 56 : 64;
-    scrollerRef.current?.scrollTo({ top: i * ROW, behavior: reducedRef.current ? 'auto' : 'smooth' });
-  };
+  }, [n, renderFromScroll, glideTo, goTo, release]);
 
   return (
     <div ref={rootRef} className="relative h-dvh overflow-hidden" style={{ backgroundColor: first.tint }}>
+      <div ref={bgLoRef} aria-hidden className="absolute inset-0" style={{ backgroundColor: first.tint }} />
+      <div
+        ref={bgHiRef}
+        aria-hidden
+        className="absolute inset-0 will-change-[opacity]"
+        style={{ backgroundColor: projects[Math.min(1, n - 1)].tint, opacity: 0 }}
+      />
+
       <header className="pointer-events-none absolute left-0 top-0 z-20 px-24 pt-11 max-[820px]:px-4 max-[820px]:pt-5">
         <h1 className="text-[17px] font-semibold leading-snug tracking-[-0.01em] text-ink max-[820px]:text-[15px]">
           {site.name}
@@ -238,7 +353,7 @@ export default function Portfolio({ projects }: { projects: ResolvedProject[] })
             open doors.
           </strong>
         </p>
-        <ul className="pointer-events-auto mt-3 flex gap-4 font-mono text-[12px] text-muted max-[820px]:mt-2 max-[820px]:gap-3 max-[820px]:text-[12px]">
+        <ul className="pointer-events-auto mt-3 flex gap-4 font-mono text-[12px] text-muted max-[820px]:mt-2 max-[820px]:gap-3">
           {[
             ['Email', `mailto:${site.email}`],
             ['GitHub', site.github],
@@ -270,7 +385,7 @@ export default function Portfolio({ projects }: { projects: ResolvedProject[] })
             <ul>
               {projects.map((p, i) => {
                 const ad = Math.min(i, 4);
-                // Pre-hydration pose for pos = 0; JS takes over on mount.
+                // Pre-hydration pose for pos = 0 (CSS trig); JS takes over on mount.
                 const initial = { '--d': i, '--k': i === 0 ? 1 : 0, '--ad': ad } as CSSProperties;
                 return (
                   <li key={p.name}>
@@ -279,7 +394,7 @@ export default function Portfolio({ projects }: { projects: ResolvedProject[] })
                         rowRefs.current[i] = el;
                       }}
                       type="button"
-                      aria-current={i === active ? 'true' : undefined}
+                      aria-current={i === 0 ? 'true' : undefined}
                       onClick={() => goTo(i)}
                       onFocus={(e) => {
                         if (e.currentTarget.matches(':focus-visible')) goTo(i);
@@ -324,9 +439,12 @@ export default function Portfolio({ projects }: { projects: ResolvedProject[] })
                   {projects.map((p, i) => (
                     <div
                       key={p.name}
+                      ref={(el) => {
+                        screenRefs.current[i] = el;
+                      }}
                       className="relative overflow-hidden"
                       style={{ height: `${100 / n}%`, backgroundColor: p.screen }}
-                      aria-hidden={i !== active}
+                      aria-hidden={i === 0 ? undefined : true}
                     >
                       {p.video ? (
                         <video
@@ -349,9 +467,7 @@ export default function Portfolio({ projects }: { projects: ResolvedProject[] })
                           >
                             {p.name[0]}
                           </div>
-                          <p className="font-mono text-[12px] leading-snug text-muted">
-                            [{p.name} screen recording]
-                          </p>
+                          <p className="font-mono text-[12px] leading-snug text-muted">[{p.name} screen recording]</p>
                         </div>
                       )}
                     </div>
@@ -360,7 +476,7 @@ export default function Portfolio({ projects }: { projects: ResolvedProject[] })
               </div>
 
               {/* All blurbs share one grid cell: the tallest reserves the height and they
-                  cross-fade as you scroll. Screen readers only get the active one. */}
+                  cross-fade as you scroll. Screen readers get the live region below. */}
               <div className="mt-6 grid max-w-[360px] px-6 text-center text-[15px] leading-[1.45] text-body max-[820px]:mt-4 max-[820px]:px-0 max-[820px]:text-[12px]">
                 {projects.map((p, i) => (
                   <p
@@ -368,7 +484,7 @@ export default function Portfolio({ projects }: { projects: ResolvedProject[] })
                     ref={(el) => {
                       captionRefs.current[i] = el;
                     }}
-                    aria-hidden={i !== active}
+                    aria-hidden={i === 0 ? undefined : true}
                     className="col-start-1 row-start-1 will-change-[opacity,transform]"
                     style={{ opacity: i === 0 ? 1 : 0 }}
                   >
@@ -376,8 +492,8 @@ export default function Portfolio({ projects }: { projects: ResolvedProject[] })
                   </p>
                 ))}
               </div>
-              <p aria-live="polite" className="sr-only">
-                {projects[active].blurb}
+              <p ref={liveRef} aria-live="polite" className="sr-only">
+                {first.blurb}
               </p>
             </div>
           </div>
