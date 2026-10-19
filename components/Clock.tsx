@@ -21,7 +21,7 @@ export default function Clock() {
   }, []);
 
   return (
-    <p className="pointer-events-none absolute bottom-0 right-0 z-20 px-24 pb-10 font-mono text-[12px] tabular-nums text-muted max-[820px]:px-4 max-[820px]:pb-5">
+    <p className="absolute bottom-0 right-0 px-24 pb-10 font-mono text-[12px] tabular-nums text-muted max-[820px]:px-4 max-[820px]:pb-5">
       Timișoara · <time suppressHydrationWarning>{time || '--:--'}</time>
     </p>
   );

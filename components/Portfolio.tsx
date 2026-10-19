@@ -26,8 +26,7 @@ export default function Portfolio({ projects }: { projects: ResolvedProject[] })
   const first = projects[0];
 
   const rootRef = useRef<HTMLDivElement>(null);
-  const bgLoRef = useRef<HTMLDivElement>(null);
-  const bgHiRef = useRef<HTMLDivElement>(null);
+  const bgRefs = useRef<(HTMLDivElement | null)[]>([]);
   const accentRef = useRef<HTMLElement>(null);
   const scrollerRef = useRef<HTMLDivElement>(null);
   const stripRef = useRef<HTMLDivElement>(null);
@@ -41,7 +40,9 @@ export default function Portfolio({ projects }: { projects: ResolvedProject[] })
   const mobileRef = useRef(false);
   const reducedRef = useRef(false);
   const lastPosRef = useRef(Number.NaN);
-  const lastLoRef = useRef(-1);
+  // True where the browser runs the visuals itself (CSS scroll-driven animations,
+  // see scrollCss.ts). JS then only handles video, aria state and haptics.
+  const cssDrivenRef = useRef(false);
   const activeRef = useRef(0);
 
   // Eased scroll state. While `owned`, this loop writes scrollTop itself and
@@ -68,6 +69,7 @@ export default function Portfolio({ projects }: { projects: ResolvedProject[] })
       if (pos === lastPosRef.current) return;
       lastPosRef.current = pos;
 
+      const visuals = !cssDrivenRef.current;
       const mobile = mobileRef.current;
       const reduced = reducedRef.current;
       const A = CURVE * (mobile ? 0.42 : 1);
@@ -83,7 +85,7 @@ export default function Portfolio({ projects }: { projects: ResolvedProject[] })
         const k = Math.max(0, 1 - absD);
         const sc = (0.72 + 0.28 * c) * (mobile ? 0.9 + 0.22 * k : 1);
 
-        const row = rowRefs.current[i];
+        const row = visuals && rowRefs.current[i];
         if (row) {
           row.style.transform = reduced
             ? 'none'
@@ -91,10 +93,10 @@ export default function Portfolio({ projects }: { projects: ResolvedProject[] })
           row.style.opacity = Math.max(0.1, c * (1 - ad * 0.12)).toFixed(3);
         }
 
-        const dot = dotRefs.current[i];
+        const dot = visuals && dotRefs.current[i];
         if (dot) dot.style.transform = `scale(${Math.max(0, 1 - ad * 1.5).toFixed(3)})`;
 
-        const caption = captionRefs.current[i];
+        const caption = visuals && captionRefs.current[i];
         if (caption) {
           caption.style.opacity = clamp(1 - absD * 1.8, 0, 1).toFixed(3);
           caption.style.transform = reduced ? 'none' : `translate3d(0,${(d * 14).toFixed(2)}px,0)`;
@@ -118,22 +120,21 @@ export default function Portfolio({ projects }: { projects: ResolvedProject[] })
         }
       }
 
-      if (stripRef.current) {
+      if (visuals && stripRef.current) {
         stripRef.current.style.transform = `translate3d(0,${(-(pos / n) * 100).toFixed(4)}%,0)`;
       }
 
-      // Background: two full-screen color layers, the upper one fading in. Only
-      // opacity changes per frame (repainting a full-screen color would not be free).
-      const lo = Math.floor(pos);
-      const hi = Math.min(lo + 1, n - 1);
-      const f = pos - lo;
-      if (lo !== lastLoRef.current) {
-        lastLoRef.current = lo;
-        if (bgLoRef.current) bgLoRef.current.style.backgroundColor = projects[lo].tint;
-        if (bgHiRef.current) bgHiRef.current.style.backgroundColor = projects[hi].tint;
+      if (visuals) {
+        // Background: stacked full-screen color layers; layer i fades in as pos
+        // goes from i-1 to i. Only opacity changes, so nothing repaints.
+        for (let i = 1; i < n; i++) {
+          const bg = bgRefs.current[i];
+          if (bg) bg.style.opacity = clamp(pos - (i - 1), 0, 1).toFixed(4);
+        }
+        const lo = Math.floor(pos);
+        const hi = Math.min(lo + 1, n - 1);
+        if (accentRef.current) accentRef.current.style.color = accents(lo, hi, pos - lo);
       }
-      if (bgHiRef.current) bgHiRef.current.style.opacity = f.toFixed(4);
-      if (accentRef.current) accentRef.current.style.color = accents(lo, hi, f);
 
       const a = Math.round(pos);
       if (a !== activeRef.current) {
@@ -239,6 +240,7 @@ export default function Portfolio({ projects }: { projects: ResolvedProject[] })
       reducedRef.current = rq.matches;
       lastPosRef.current = Number.NaN;
     };
+    cssDrivenRef.current = CSS.supports('animation-timeline: scroll()');
     readMedia();
     renderFromScroll();
 
@@ -335,48 +337,60 @@ export default function Portfolio({ projects }: { projects: ResolvedProject[] })
 
   return (
     <div ref={rootRef} className="relative h-dvh overflow-hidden" style={{ backgroundColor: first.tint }}>
-      <div ref={bgLoRef} aria-hidden className="absolute inset-0" style={{ backgroundColor: first.tint }} />
-      <div
-        ref={bgHiRef}
-        aria-hidden
-        className="absolute inset-0 will-change-[opacity]"
-        style={{ backgroundColor: projects[Math.min(1, n - 1)].tint, opacity: 0 }}
-      />
-
-      <header className="pointer-events-none absolute left-0 top-0 z-20 px-24 pt-11 max-[820px]:px-4 max-[820px]:pt-5">
-        <h1 className="text-[17px] font-semibold leading-snug tracking-[-0.01em] text-ink max-[820px]:text-[15px]">
-          {site.name}
-        </h1>
-        <p className="mt-0.5 text-[17px] leading-snug tracking-[-0.01em] text-body max-[820px]:text-[15px]">
-          I build apps that{' '}
-          <strong ref={accentRef} className="font-semibold" style={{ color: first.color }}>
-            open doors.
-          </strong>
-        </p>
-        <ul className="pointer-events-auto mt-3 flex gap-4 font-mono text-[12px] text-muted max-[820px]:mt-2 max-[820px]:gap-3">
-          {[
-            ['Email', `mailto:${site.email}`],
-            ['GitHub', site.github],
-            ['LinkedIn', site.linkedin],
-          ].map(([label, href]) => (
-            <li key={label}>
-              <a
-                href={href}
-                {...(href.startsWith('http') ? { target: '_blank', rel: 'noopener noreferrer' } : {})}
-                className="rounded-sm underline decoration-current/30 underline-offset-[3px] transition-colors hover:text-ink hover:decoration-current focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ink"
-              >
-                {label}
-              </a>
-            </li>
-          ))}
-        </ul>
-      </header>
-
       <div
         ref={scrollerRef}
-        className="no-scrollbar absolute inset-0 snap-y snap-mandatory overflow-y-auto overflow-x-hidden overscroll-contain"
+        className="wheel-scroller no-scrollbar absolute inset-0 snap-y snap-mandatory overflow-y-auto overflow-x-hidden overscroll-contain"
       >
-        <div className="grid grid-cols-2 max-[820px]:grid-cols-[1.35fr_1fr]">
+        {/* Fixed layers live inside the scroller (sticky, zero net height) so CSS
+            scroll-driven animations can follow its timeline. */}
+        <div aria-hidden className="pointer-events-none sticky top-0 z-0 -mb-[100dvh] h-dvh">
+          {projects.map((p, i) =>
+            i === 0 ? null : (
+              <div
+                key={p.name}
+                ref={(el) => {
+                  bgRefs.current[i] = el;
+                }}
+                className={`wheel-bg-${i} absolute inset-0 will-change-[opacity]`}
+                style={{ backgroundColor: p.tint, opacity: 0 }}
+              />
+            ),
+          )}
+        </div>
+
+        <div className="pointer-events-none sticky top-0 z-20 -mb-[100dvh] h-dvh">
+          <header className="absolute left-0 top-0 px-24 pt-11 max-[820px]:px-4 max-[820px]:pt-5">
+            <h1 className="text-[17px] font-semibold leading-snug tracking-[-0.01em] text-ink max-[820px]:text-[15px]">
+              {site.name}
+            </h1>
+            <p className="mt-0.5 text-[17px] leading-snug tracking-[-0.01em] text-body max-[820px]:text-[15px]">
+              I build apps that{' '}
+              <strong ref={accentRef} className="wheel-accent font-semibold" style={{ color: first.color }}>
+                open doors.
+              </strong>
+            </p>
+            <ul className="pointer-events-auto mt-3 flex gap-4 font-mono text-[12px] text-muted max-[820px]:mt-2 max-[820px]:gap-3">
+              {[
+                ['Email', `mailto:${site.email}`],
+                ['GitHub', site.github],
+                ['LinkedIn', site.linkedin],
+              ].map(([label, href]) => (
+                <li key={label}>
+                  <a
+                    href={href}
+                    {...(href.startsWith('http') ? { target: '_blank', rel: 'noopener noreferrer' } : {})}
+                    className="rounded-sm underline decoration-current/30 underline-offset-[3px] transition-colors hover:text-ink hover:decoration-current focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ink"
+                  >
+                    {label}
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </header>
+          <Clock />
+        </div>
+
+        <div className="relative z-10 grid grid-cols-2 max-[820px]:grid-cols-[1.35fr_1fr]">
           <nav
             aria-label="Projects"
             className="pl-24 [perspective:900px] max-[820px]:pl-2.5 max-[820px]:[perspective:520px]"
@@ -407,7 +421,7 @@ export default function Portfolio({ projects }: { projects: ResolvedProject[] })
                           dotRefs.current[i] = el;
                         }}
                         aria-hidden
-                        className="size-2 shrink-0 rounded-full will-change-transform"
+                        className="wheel-dot size-2 shrink-0 rounded-full will-change-transform"
                         style={{ backgroundColor: p.color, transform: `scale(${Math.max(0, 1 - ad * 1.5)})` }}
                       />
                       <span className="text-[30px] font-semibold leading-none tracking-[-0.03em] max-[820px]:text-[19px]">
@@ -433,7 +447,7 @@ export default function Portfolio({ projects }: { projects: ResolvedProject[] })
               >
                 <div
                   ref={stripRef}
-                  className="absolute inset-x-0 top-0 will-change-transform"
+                  className="wheel-strip absolute inset-x-0 top-0 will-change-transform"
                   style={{ height: `${n * 100}%` }}
                 >
                   {projects.map((p, i) => (
@@ -485,7 +499,7 @@ export default function Portfolio({ projects }: { projects: ResolvedProject[] })
                       captionRefs.current[i] = el;
                     }}
                     aria-hidden={i === 0 ? undefined : true}
-                    className="col-start-1 row-start-1 will-change-[opacity,transform]"
+                    className={`wheel-cap-${i} col-start-1 row-start-1 will-change-[opacity,transform]`}
                     style={{ opacity: i === 0 ? 1 : 0 }}
                   >
                     {p.blurb}
@@ -499,8 +513,6 @@ export default function Portfolio({ projects }: { projects: ResolvedProject[] })
           </div>
         </div>
       </div>
-
-      <Clock />
     </div>
   );
 }

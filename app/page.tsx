@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { projects } from '@/content/projects';
 import Portfolio, { type ResolvedProject } from '@/components/Portfolio';
+import { buildScrollCss } from '@/components/scrollCss';
 
 // Resolved at build time: a project only gets a <video> if the file is
 // actually in /public, and a poster if the matching .jpg exists.
@@ -16,5 +17,12 @@ function resolve(): ResolvedProject[] {
 }
 
 export default function Page() {
-  return <Portfolio projects={resolve()} />;
+  const resolved = resolve();
+  return (
+    <>
+      {/* Scroll-driven animations, generated from the same math as the JS fallback. */}
+      <style dangerouslySetInnerHTML={{ __html: buildScrollCss(resolved) }} />
+      <Portfolio projects={resolved} />
+    </>
+  );
 }
